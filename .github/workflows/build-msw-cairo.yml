@@ -1,0 +1,341 @@
+#---------------------------------------------------------------------------
+# This workflow builds libcairo for Windows (x86, x64 and arm64) using vcpkg,
+# for bundling with wxPython on Windows. With the "release" input checked, it
+# publishes the result as a release of this repo, which wxPython's build
+# downloads (see MSW_cairo_tag in Phoenix's build_wxpy.py).
+#
+# Each libcairo-2.dll is self-contained: cairo's dependencies (pixman,
+# libpng, zlib, freetype, ...) and the C runtime are linked statically, so it
+# only imports system DLLs. The PDF, PS and SVG surfaces are enabled.
+#
+# The msw-cairo-*.zip asset holds an msw-cairo folder with the headers, each
+# arch's DLL in <arch>/bin, the license files for everything linked in, and
+# the package versions that went into each build. The PDB files are in a
+# separate msw-cairo-*-pdb.zip.
+#---------------------------------------------------------------------------
+
+name: Build MSW cairo
+
+on:
+  workflow_dispatch:
+    inputs:
+      vcpkg_ref:
+        description: 'vcpkg branch, tag or commit to build from'
+        type: string
+        default: 'master'
+      release:
+        description: 'Publish the build as a release of this repo'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # always use bash shell, even on windows
+    shell: bash
+
+env:
+  PYTHONUNBUFFERED: 1
+
+#---------------------------------------------------------------------------
+
+jobs:
+  # Resolve the vcpkg ref once so that every arch builds the same commit, and
+  # work out the release tag.
+  setup:
+    runs-on: ubuntu-24.04
+
+    outputs:
+      vcpkg_sha: ${{ steps.resolve.outputs.vcpkg_sha }}
+      vcpkg_name: ${{ steps.resolve.outputs.vcpkg_name }}
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+
+    steps:
+      - name: Resolve vcpkg ref
+        id: resolve
+        env:
+          VCPKG_REF: ${{ inputs.vcpkg_ref }}
+          RELEASE: ${{ inputs.release }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git clone --filter=blob:none --sparse https://github.com/microsoft/vcpkg.git vcpkg
+          cd vcpkg
+          git sparse-checkout set ports/cairo
+          # The clone only has a local branch for master, so look for other
+          # branches under origin/ before trying the ref as a tag or commit.
+          git checkout --detach "origin/$VCPKG_REF" 2>/dev/null || git checkout --detach "$VCPKG_REF"
+
+          vcpkg_sha=$(git rev-parse HEAD)
+          vcpkg_name=$(git describe --tags --exact-match 2>/dev/null || git rev-parse --short=10 HEAD)
+          version=$(jq -r .version ports/cairo/vcpkg.json)
+          tag="cairo-$version-vcpkg$vcpkg_name"
+          echo "Building cairo $version from vcpkg $vcpkg_name ($vcpkg_sha) as $tag"
+          {
+              echo "vcpkg_sha=$vcpkg_sha"
+              echo "vcpkg_name=$vcpkg_name"
+              echo "version=$version"
+              echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$RELEASE" = true ] && gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              echo "::error::Release $tag already exists"
+              exit 1
+          fi
+
+  build-cairo:
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: windows-2025
+          - arch: x86
+            os: windows-2025
+          - arch: arm64
+            os: windows-11-arm
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      ARCH: ${{ matrix.arch }}
+      TRIPLET: ${{ matrix.arch }}-windows-wxpy
+      VCPKG_SHA: ${{ needs.setup.outputs.vcpkg_sha }}
+      VCPKG_NAME: ${{ needs.setup.outputs.vcpkg_name }}
+
+    steps:
+      - name: Set up vcpkg
+        run: |
+          VCPKG_ROOT="$(cygpath -m "$RUNNER_TEMP")/vcpkg"
+          echo "VCPKG_ROOT=$VCPKG_ROOT" >> "$GITHUB_ENV"
+          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
+          git -C "$VCPKG_ROOT" checkout --detach "$VCPKG_SHA"
+          "$VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+
+      - name: Create triplet
+        run: |
+          mkdir -p triplets
+          cat > "triplets/$TRIPLET.cmake" <<EOF
+          set(VCPKG_TARGET_ARCHITECTURE $ARCH)
+          set(VCPKG_CRT_LINKAGE static)
+          set(VCPKG_LIBRARY_LINKAGE static)
+          set(VCPKG_BUILD_TYPE release)
+          if(PORT STREQUAL "cairo")
+              set(VCPKG_LIBRARY_LINKAGE dynamic)
+          endif()
+          EOF
+          cat "triplets/$TRIPLET.cmake"
+
+      - name: Build cairo
+        run: |
+          # Naming freetype[core] keeps freetype's default features (brotli,
+          # bzip2, ...) out of the DLL.
+          "$VCPKG_ROOT/vcpkg.exe" install \
+              --overlay-triplets=triplets \
+              "cairo[core,freetype]:$TRIPLET" \
+              "freetype[core]:$TRIPLET"
+
+      - name: Save build logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: vcpkg-logs-${{ matrix.arch }}
+          path: ${{ env.VCPKG_ROOT }}/buildtrees/**/*.log
+
+      - name: Collect files
+        run: |
+          installed="$VCPKG_ROOT/installed/$TRIPLET"
+          ls -l "$installed/bin"
+
+          out=msw-cairo
+          mkdir -p "$out/$ARCH/bin" "$out/$ARCH/pdb" "$out/include" "$out/licenses"
+          # wx and wx.lib.wxcairo look for the MinGW name, libcairo-2.dll
+          cp "$installed/bin/cairo-2.dll" "$out/$ARCH/bin/libcairo-2.dll"
+          if [ -f "$installed/bin/cairo-2.pdb" ]; then
+              cp "$installed/bin/cairo-2.pdb" "$out/$ARCH/pdb/"
+          fi
+          cp -r "$installed/include/cairo" "$out/include/"
+          for f in "$installed"/share/*/copyright; do
+              cp "$f" "$out/licenses/$(basename "$(dirname "$f")").txt"
+          done
+
+          {
+              echo "vcpkg $VCPKG_NAME ($VCPKG_SHA)"
+              echo
+              "$VCPKG_ROOT/vcpkg.exe" list --overlay-triplets=triplets --x-full-desc
+          } > "$out/$ARCH/packages.txt"
+          cat "$out/$ARCH/packages.txt"
+
+          grep -q '^#define CAIRO_HAS_PDF_SURFACE 1' "$out/include/cairo/cairo-features.h"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+          architecture: ${{ matrix.arch }}
+
+      - name: Test DLL
+        run: |
+          python -m pip install pefile
+          python - "msw-cairo/$ARCH/bin/libcairo-2.dll" <<'EOF'
+          import ctypes
+          import os
+          import sys
+
+          import pefile
+
+          dll = os.path.abspath(sys.argv[1])
+
+          # Only Windows' own DLLs should be needed, not the VC++ runtime or
+          # any of cairo's dependencies.
+          pe = pefile.PE(dll)
+          imports = sorted(entry.dll.decode().lower()
+                           for entry in pe.DIRECTORY_ENTRY_IMPORT
+                                        + getattr(pe, 'DIRECTORY_ENTRY_DELAY_IMPORT', []))
+          print('Imports:', ', '.join(imports))
+          sysdir = os.path.join(os.environ['SystemRoot'], 'System32')
+          bad = [name for name in imports
+                 if name.startswith(('vcruntime', 'msvcp', 'concrt', 'ucrtbase', 'api-ms-win-crt'))
+                 or not (name.startswith(('api-ms-win-', 'ext-ms-'))
+                         or os.path.exists(os.path.join(sysdir, name)))]
+          if bad:
+              sys.exit(f'Non-system DLL imports: {", ".join(bad)}')
+
+          cairo = ctypes.CDLL(dll)
+          cairo.cairo_version_string.restype = ctypes.c_char_p
+          print('cairo', cairo.cairo_version_string().decode())
+
+          cairo.cairo_pdf_surface_create.restype = ctypes.c_void_p
+          cairo.cairo_pdf_surface_create.argtypes = [ctypes.c_char_p, ctypes.c_double, ctypes.c_double]
+          cairo.cairo_create.restype = ctypes.c_void_p
+          cairo.cairo_create.argtypes = [ctypes.c_void_p]
+          for name in ['cairo_status', 'cairo_fill', 'cairo_show_page', 'cairo_destroy']:
+              getattr(cairo, name).argtypes = [ctypes.c_void_p]
+          for name in ['cairo_surface_status', 'cairo_surface_finish', 'cairo_surface_destroy']:
+              getattr(cairo, name).argtypes = [ctypes.c_void_p]
+          cairo.cairo_set_source_rgb.argtypes = [ctypes.c_void_p] + [ctypes.c_double] * 3
+          cairo.cairo_rectangle.argtypes = [ctypes.c_void_p] + [ctypes.c_double] * 4
+          cairo.cairo_move_to.argtypes = [ctypes.c_void_p] + [ctypes.c_double] * 2
+          cairo.cairo_select_font_face.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+          cairo.cairo_set_font_size.argtypes = [ctypes.c_void_p, ctypes.c_double]
+          cairo.cairo_show_text.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
+          surface = cairo.cairo_pdf_surface_create(b'test.pdf', 200, 200)
+          cr = cairo.cairo_create(surface)
+          cairo.cairo_set_source_rgb(cr, 1, 0, 0)
+          cairo.cairo_rectangle(cr, 10, 10, 100, 100)
+          cairo.cairo_fill(cr)
+          cairo.cairo_set_source_rgb(cr, 0, 0, 0)
+          cairo.cairo_select_font_face(cr, b'Arial', 0, 0)
+          cairo.cairo_set_font_size(cr, 20)
+          cairo.cairo_move_to(cr, 10, 150)
+          cairo.cairo_show_text(cr, b'wxPython')
+          cairo.cairo_show_page(cr)
+          if cairo.cairo_status(cr):
+              sys.exit(f'cairo_status: {cairo.cairo_status(cr)}')
+          cairo.cairo_destroy(cr)
+          cairo.cairo_surface_finish(surface)
+          if cairo.cairo_surface_status(surface):
+              sys.exit(f'cairo_surface_status: {cairo.cairo_surface_status(surface)}')
+          cairo.cairo_surface_destroy(surface)
+
+          with open('test.pdf', 'rb') as f:
+              data = f.read()
+          if not data.startswith(b'%PDF-') or b'%%EOF' not in data[-32:]:
+              sys.exit('test.pdf is not a complete PDF')
+          print(f'Wrote a {len(data)} byte PDF')
+          EOF
+
+      - name: Save cairo as job artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: msw-cairo-${{ matrix.arch }}
+          path: msw-cairo
+
+  # Combine the builds into one zip, and publish it if asked to
+  package:
+    needs: [setup, build-cairo]
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+
+    env:
+      TAG: ${{ needs.setup.outputs.tag }}
+      VERSION: ${{ needs.setup.outputs.version }}
+      VCPKG_SHA: ${{ needs.setup.outputs.vcpkg_sha }}
+      VCPKG_NAME: ${{ needs.setup.outputs.vcpkg_name }}
+
+    steps:
+      - name: Download builds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: msw-cairo-*
+          path: parts
+
+      - name: Combine builds
+        run: |
+          mkdir msw-cairo
+          cp -r parts/msw-cairo-x64/include parts/msw-cairo-x64/licenses msw-cairo/
+          for arch in x64 x86 arm64; do
+              diff -r msw-cairo/include "parts/msw-cairo-$arch/include"
+              cp -r "parts/msw-cairo-$arch/$arch" msw-cairo/
+          done
+          find msw-cairo -type f | sort
+
+          mkdir dist
+          zip -r -X "dist/msw-$TAG.zip" msw-cairo -x 'msw-cairo/*/pdb*'
+          if compgen -G 'msw-cairo/*/pdb/*' > /dev/null; then
+              zip -r -X "dist/msw-$TAG-pdb.zip" msw-cairo/*/pdb
+          fi
+          (cd dist && sha256sum *.zip > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Save zips as job artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: msw-${{ env.TAG }}
+          path: dist
+
+      - name: Attest build provenance
+        if: inputs.release
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*.zip
+
+      - name: Create release
+        if: inputs.release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+              echo "cairo $VERSION for Windows (x64, x86 and arm64), built from vcpkg $VCPKG_NAME"
+              echo "(microsoft/vcpkg@$VCPKG_SHA) by"
+              echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
+              echo
+              echo '```'
+              cat dist/SHA256SUMS
+              echo '```'
+              for arch in x64 x86 arm64; do
+                  echo
+                  echo "<details><summary>$arch packages</summary>"
+                  echo
+                  echo '```'
+                  cat "msw-cairo/$arch/packages.txt"
+                  echo '```'
+                  echo
+                  echo '</details>'
+              done
+          } > notes.md
+
+          gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "cairo $VERSION (vcpkg $VCPKG_NAME)" \
+              --notes-file notes.md
